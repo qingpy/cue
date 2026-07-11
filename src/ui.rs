@@ -94,6 +94,7 @@ pub struct App {
     notice: Option<String>,
     input: String,
     focus_input: bool,
+    input_expanded: bool,
     followup: String,
     response: String,
     transcript: String,
@@ -106,6 +107,7 @@ pub struct App {
     had_focus: bool,
     want_visible: bool,
     dav_rx: Option<Receiver<dav::Done>>,
+    dav_list: Option<Vec<String>>,
 }
 
 fn square_style(ctx: &Context) {
@@ -151,6 +153,13 @@ fn section(ui: &mut Ui, label: &str) {
     ui.add_space(10.0);
     ui.label(RichText::new(label).monospace().size(10.0).color(WEAK));
     ui.add_space(2.0);
+}
+
+/// First non-empty line, with an ellipsis when more follows.
+fn one_line(text: &str) -> String {
+    let mut lines = text.lines().filter(|l| !l.trim().is_empty());
+    let first = lines.next().unwrap_or("").to_string();
+    if lines.next().is_some() { format!("{first} ...") } else { first }
 }
 
 fn restart() -> ! {
@@ -228,6 +237,7 @@ impl App {
             draft: None,
             input: String::new(),
             focus_input: false,
+            input_expanded: false,
             followup: String::new(),
             response: String::new(),
             transcript: String::new(),
@@ -239,6 +249,7 @@ impl App {
             cache: CommonMarkCache::default(),
             had_focus: false,
             dav_rx: None,
+            dav_list: None,
         }
     }
 
@@ -253,7 +264,10 @@ impl App {
     fn poll_dav(&mut self) {
         let Some(rx) = self.dav_rx.take() else { return };
         match rx.try_recv() {
-            Ok(dav::Done::Backup(Ok(()))) => self.notice = Some("backup uploaded".into()),
+            Ok(dav::Done::Backup(Ok(()))) => {
+                self.dav_list = None; // refetch so the new backup shows
+                self.notice = Some("backup uploaded".into());
+            }
             Ok(dav::Done::Backup(Err(e))) => self.notice = Some(format!("backup failed: {e}")),
             Ok(dav::Done::Restore(Ok(body))) => match toml::from_str::<config::Config>(&body) {
                 Ok(mut c) => {
@@ -291,6 +305,14 @@ impl App {
                 Err(e) => self.notice = Some(format!("restore: not a valid config: {e}")),
             },
             Ok(dav::Done::Restore(Err(e))) => self.notice = Some(format!("restore failed: {e}")),
+            Ok(dav::Done::List(Ok(names))) => {
+                if names.is_empty() {
+                    self.notice = Some("no backups found".into());
+                } else {
+                    self.dav_list = Some(names);
+                }
+            }
+            Ok(dav::Done::List(Err(e))) => self.notice = Some(format!("list failed: {e}")),
             Err(std::sync::mpsc::TryRecvError::Empty) => self.dav_rx = Some(rx),
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {}
         }
@@ -311,8 +333,10 @@ impl App {
             }
             Err(e) => self.notice = Some(e),
         }
-        // with captured text, leave focus on the window so number keys fire;
-        // with nothing captured, put the caret in the input for typing
+        // with captured text, show a folded preview and keep focus on the
+        // window so number keys fire; with nothing captured, expand the input
+        // with the caret in it for typing
+        self.input_expanded = text.is_empty();
         self.focus_input = text.is_empty();
         self.input = text;
         self.had_focus = false;
@@ -325,6 +349,7 @@ impl App {
     }
 
     fn open_settings(&mut self) {
+        self.dav_list = None;
         if self.draft.is_none() {
             if let Ok((cfg, _)) = config::load() {
                 self.cfg = cfg;
@@ -476,24 +501,43 @@ impl App {
             close = drag_header(ui, ctx, "CUE");
             ui.add_space(6.0);
 
-            // consume Enter before the TextEdit sees it, so it dispatches the
-            // action instead of inserting a newline at the caret
+            // folds to a one-line preview when unfocused (captured text can be
+            // long); clicking expands it to the editor
             let input_id = Id::new("assist-input");
-            let enter = ctx.memory(|m| m.has_focus(input_id))
-                && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Enter));
-            let input_resp = ui.add(
-                TextEdit::multiline(&mut self.input)
-                    .id(input_id)
-                    .desired_rows(2)
-                    .desired_width(f32::INFINITY)
-                    .hint_text("enter runs action 1"),
-            );
-            if self.focus_input {
-                self.focus_input = false;
-                input_resp.request_focus();
-            }
-            if enter {
-                self.run_action(0, ctx);
+            if self.input_expanded {
+                // consume Enter before the TextEdit sees it, so it dispatches
+                // the action instead of inserting a newline at the caret
+                let enter = ctx.memory(|m| m.has_focus(input_id))
+                    && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Enter));
+                let te = ui.add(
+                    TextEdit::multiline(&mut self.input)
+                        .id(input_id)
+                        .desired_rows(2)
+                        .desired_width(f32::INFINITY)
+                        .hint_text("enter runs action 1"),
+                );
+                if self.focus_input {
+                    self.focus_input = false;
+                    te.request_focus();
+                }
+                if te.lost_focus() && !enter {
+                    self.input_expanded = false;
+                }
+                if enter {
+                    self.run_action(0, ctx);
+                }
+            } else {
+                let mut preview = one_line(&self.input);
+                let r = ui.add(
+                    TextEdit::singleline(&mut preview)
+                        .id(input_id.with("preview"))
+                        .desired_width(f32::INFINITY)
+                        .hint_text("enter runs action 1"),
+                );
+                if r.gained_focus() {
+                    self.input_expanded = true;
+                    self.focus_input = true;
+                }
             }
             ui.add_space(6.0);
 
@@ -574,7 +618,10 @@ impl App {
         let mut cancel = false;
         let mut do_backup = false;
         let mut do_restore = false;
+        let mut do_list = false;
+        let mut restore_pick: Option<String> = None;
         let dav_idle = self.dav_rx.is_none();
+        let dav_list = self.dav_list.clone();
 
         Panel::top("shead").frame(pad).show_separator_line(false).show(ui, |ui| {
             cancel = drag_header(ui, ctx, "CUE · SETTINGS");
@@ -671,11 +718,7 @@ impl App {
                                 d.expanded = None;
                             }
                         } else {
-                            let mut preview = {
-                                let mut lines = a.prompt.lines().filter(|l| !l.trim().is_empty());
-                                let first = lines.next().unwrap_or("").to_string();
-                                if lines.next().is_some() { format!("{first} ...") } else { first }
-                            };
+                            let mut preview = one_line(&a.prompt);
                             let r = ui.add(
                                 TextEdit::singleline(&mut preview)
                                     .id(pid.with("preview"))
@@ -724,12 +767,43 @@ impl App {
                         );
                     });
                     ui.horizontal(|ui| {
-                        let ready = !d.dav_url.trim().is_empty() && dav_idle;
-                        if ui.add_enabled(ready, Button::new("backup")).clicked() {
+                        let has_url = !d.dav_url.trim().is_empty();
+                        if ui.add_enabled(has_url && dav_idle, Button::new("backup")).clicked() {
                             do_backup = true;
                         }
-                        if ui.add_enabled(ready, Button::new("restore")).clicked() {
-                            do_restore = true;
+                        if dav::is_file_url(d.dav_url.trim()) {
+                            // single-file url: restore it directly, no list
+                            if ui.add_enabled(has_url && dav_idle, Button::new("restore")).clicked() {
+                                do_restore = true;
+                            }
+                        } else {
+                            // folder: the restore button drops the backup list
+                            // open on click (fetched lazily when first shown)
+                            ui.add_enabled_ui(has_url, |ui| {
+                                ui.menu_button("restore", |ui| match &dav_list {
+                                    None => {
+                                        ui.spinner();
+                                        do_list = true;
+                                    }
+                                    Some(names) if names.is_empty() => {
+                                        ui.label("no backups");
+                                    }
+                                    Some(names) => {
+                                        ui.set_min_width(180.0);
+                                        for n in names {
+                                            let label = n
+                                                .trim_start_matches("cue-settings")
+                                                .trim_start_matches('-')
+                                                .trim_end_matches(".toml");
+                                            let label = if label.is_empty() { n } else { label };
+                                            if ui.button(label).clicked() {
+                                                restore_pick = Some(n.clone());
+                                                ui.close();
+                                            }
+                                        }
+                                    }
+                                });
+                            });
                         }
                         if !dav_idle {
                             ui.spinner();
@@ -739,13 +813,17 @@ impl App {
                 });
             });
 
+        // a list fetch only starts when idle; the menu sets do_list each frame
+        let do_list = do_list && dav_idle;
         if save {
+            self.dav_list = None;
             self.save_settings();
         } else if cancel {
             self.draft = None;
+            self.dav_list = None;
             self.mode = Mode::Assist;
             self.hide();
-        } else if do_backup || do_restore {
+        } else if do_backup || do_restore || do_list || restore_pick.is_some() {
             if let Some(d) = &self.draft {
                 let cred = Self::dav_cred(d);
                 let (tx, rx) = channel();
@@ -767,8 +845,14 @@ impl App {
                             self.notice = Some(e);
                         }
                     }
+                } else if let Some(name) = restore_pick {
+                    self.dav_list = None;
+                    dav::restore(cred, name, tx, ctx.clone());
+                } else if do_restore {
+                    // single-file url: restore it directly
+                    dav::restore(cred, String::new(), tx, ctx.clone());
                 } else {
-                    dav::restore(cred, tx, ctx.clone());
+                    dav::list_backups(cred, tx, ctx.clone());
                 }
             }
         }
@@ -784,6 +868,8 @@ impl eframe::App for App {
         while let Ok(msg) = self.act_rx.try_recv() {
             self.want_visible = true;
             match msg {
+                // switches to the assist view but keeps the settings draft in
+                // the background; reopening settings restores it
                 Msg::Activate(text) => self.activate(text),
                 Msg::Settings => self.open_settings(),
             }

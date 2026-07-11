@@ -1,12 +1,75 @@
 use enigo::{Direction, Enigo, Key, Keyboard, Mouse, Settings};
 use std::thread::sleep;
 use std::time::Duration;
+use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance, CoInitializeEx, COINIT_APARTMENTTHREADED};
+use windows::Win32::UI::Accessibility::{
+    CUIAutomation, IUIAutomation, IUIAutomationTextPattern, UIA_TextPatternId,
+};
 
-/// Captures the current selection by simulating Ctrl+C and reading the
-/// clipboard, then restores the previous clipboard text. Non-text clipboard
-/// content (images, files) is left alone: it can't be cleared-and-restored,
-/// and any text read after the copy is necessarily fresh.
+enum Sel {
+    Text(String),
+    /// UIA exposes a text pattern and reports no selection - authoritative.
+    Empty,
+    /// The focused app exposes no text pattern; UIA can't tell.
+    Unknown,
+}
+
+/// Captures the current selection via UI Automation, falling back to a
+/// simulated Ctrl+C only when UIA can't answer. UIA reporting an empty
+/// selection is trusted (nothing selected -> open empty, no keystroke), so
+/// terminals aren't interrupted and editors don't copy the caret's line.
+/// Requires accessibility to be exposed by the app (e.g. VS Code needs
+/// `editor.accessibilitySupport: on`); apps without a text pattern still use
+/// Ctrl+C.
 pub fn grab_selection() -> Option<String> {
+    match uia_selection() {
+        Sel::Text(t) => Some(t),
+        Sel::Empty => None,
+        Sel::Unknown => clipboard_grab(),
+    }
+}
+
+fn uia_selection() -> Sel {
+    unsafe {
+        // repeat calls return S_FALSE; harmless on the hotkey thread
+        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        let Ok(auto) =
+            CoCreateInstance::<_, IUIAutomation>(&CUIAutomation, None, CLSCTX_INPROC_SERVER)
+        else {
+            return Sel::Unknown;
+        };
+        let Ok(el) = auto.GetFocusedElement() else {
+            return Sel::Unknown;
+        };
+        let Ok(pat) = el.GetCurrentPatternAs::<IUIAutomationTextPattern>(UIA_TextPatternId) else {
+            return Sel::Unknown;
+        };
+        let Ok(sel) = pat.GetSelection() else {
+            return Sel::Unknown;
+        };
+        let n = sel.Length().unwrap_or(0);
+        let mut out = String::new();
+        for i in 0..n {
+            if let Ok(range) = sel.GetElement(i)
+                && let Ok(t) = range.GetText(-1)
+            {
+                out.push_str(&t.to_string());
+            }
+        }
+        let out = out.trim();
+        if out.is_empty() {
+            Sel::Empty
+        } else {
+            Sel::Text(out.to_string())
+        }
+    }
+}
+
+/// Simulates Ctrl+C and reads the clipboard, then restores the previous
+/// clipboard text. Non-text clipboard content (images, files) is left alone:
+/// it can't be cleared-and-restored, and any text read after the copy is
+/// necessarily fresh.
+fn clipboard_grab() -> Option<String> {
     let mut cb = arboard::Clipboard::new().ok()?;
     let saved = cb.get_text().ok();
     if saved.is_some() {

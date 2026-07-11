@@ -11,6 +11,12 @@ pub fn install(ctx: &Context) {
     );
     fonts.families.entry(FontFamily::Proportional).or_default().insert(0, "inter".into());
 
+    // Consolas for code: egui's bundled monospace renders larger than Inter
+    if let Ok(mono) = std::fs::read(r"C:\Windows\Fonts\consola.ttf") {
+        fonts.font_data.insert("mono".into(), FontData::from_owned(mono).into());
+        fonts.families.entry(FontFamily::Monospace).or_default().insert(0, "mono".into());
+    }
+
     let candidates = [
         r"C:\Windows\Fonts\msyh.ttc",
         r"C:\Windows\Fonts\Deng.ttf",

@@ -9,9 +9,10 @@ rounded corners, hairline borders, Inter (embedded) + system CJK fallback.
 - Resident background process with a tray icon (left-click opens the
   assistant; menu: settings / quit). `autostart` syncs an HKCU Run key.
 - One global hotkey (default alt+q). On press the hotkey thread captures the
-  selection (save clipboard text, simulate Ctrl+C, read, restore; non-text
-  clipboard is left untouched), shows the window at the cursor on the
-  cursor's monitor, and messages the UI.
+  selection - UI Automation first (no keystrokes, no clipboard; a definitive
+  "no selection" sends nothing), simulated Ctrl+C with clipboard save/restore
+  only when UIA can't answer (non-text clipboard is left untouched) - then
+  shows the window at the cursor on the cursor's monitor and messages the UI.
 - Assist window (topmost, per-desktop): captured text on top (empty = input
   focused for typing), actions as numbered buttons (`1`-`9`, click, or Enter
   for action 1), streamed Markdown response, copy button, follow-up input
@@ -24,9 +25,11 @@ rounded corners, hairline borders, Inter (embedded) + system CJK fallback.
   Changing the hotkey restarts the app to re-register it.
 - Reasoning: checkbox per action inheriting the global; off sends
   OpenRouter-style `reasoning: {enabled: false}`, on sends nothing.
-- WebDAV: uploads `cue-settings.toml` (sanitized: inline keys stripped) to a
-  folder URL with Basic auth; restore validates before overwriting and keeps
-  the connection it was performed with. Redirects are treated as errors.
+- WebDAV: each backup uploads a timestamped `cue-settings-YYYYMMDD-HHMMSS.toml`
+  (sanitized: inline keys stripped) to a folder URL with Basic auth; restore
+  lists the folder (PROPFIND) and offers a picker, validates before
+  overwriting, and keeps the connection it was performed with. A url ending
+  in .toml is used verbatim (single file, no picker). Redirects are errors.
 
 ## Config & secrets
 

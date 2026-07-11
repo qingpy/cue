@@ -10,14 +10,27 @@ pub struct Cred {
 pub enum Done {
     Backup(Result<(), String>),
     Restore(Result<String, String>),
+    List(Result<Vec<String>, String>),
 }
 
-fn file_url(base: &str) -> String {
-    let base = base.trim_end_matches('/');
-    if base.ends_with(".toml") {
-        base.to_string()
-    } else {
-        format!("{base}/cue-settings.toml")
+/// A url ending in .toml is used verbatim (single-file mode); otherwise it
+/// is a folder holding timestamped backups.
+pub fn is_file_url(base: &str) -> bool {
+    base.trim_end_matches('/').ends_with(".toml")
+}
+
+fn folder(base: &str) -> &str {
+    base.trim_end_matches('/')
+}
+
+fn stamp() -> String {
+    unsafe {
+        let mut st: windows_sys::Win32::Foundation::SYSTEMTIME = std::mem::zeroed();
+        windows_sys::Win32::System::SystemInformation::GetLocalTime(&mut st);
+        format!(
+            "{:04}{:02}{:02}-{:02}{:02}{:02}",
+            st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond
+        )
     }
 }
 
@@ -35,9 +48,10 @@ fn fmt_err(e: ureq::Error) -> String {
 }
 
 /// Redirects are disabled (ureq would turn PUT into a body-less GET and
-/// report success); surface them as errors instead.
+/// report success); surface them as errors instead. 207 is PROPFIND's
+/// Multi-Status success.
 fn check(resp: ureq::Response) -> Result<ureq::Response, String> {
-    if resp.status() >= 300 {
+    if resp.status() >= 300 && resp.status() != 207 {
         Err(format!("HTTP {} (redirect - check the url)", resp.status()))
     } else {
         Ok(resp)
@@ -45,9 +59,14 @@ fn check(resp: ureq::Response) -> Result<ureq::Response, String> {
 }
 
 fn put(c: &Cred, body: &str) -> Result<(), String> {
+    let url = if is_file_url(&c.url) {
+        folder(&c.url).to_string()
+    } else {
+        format!("{}/cue-settings-{}.toml", folder(&c.url), stamp())
+    };
     let agent = crate::api::tls_agent(Some(Duration::from_secs(20)), false)?;
     agent
-        .put(&file_url(&c.url))
+        .put(&url)
         .set("Authorization", &auth(c))
         .send_string(body)
         .map_err(fmt_err)
@@ -55,15 +74,44 @@ fn put(c: &Cred, body: &str) -> Result<(), String> {
         .map(|_| ())
 }
 
-fn get(c: &Cred) -> Result<String, String> {
+fn get(c: &Cred, name: &str) -> Result<String, String> {
+    let url = if name.is_empty() {
+        folder(&c.url).to_string()
+    } else {
+        format!("{}/{name}", folder(&c.url))
+    };
     let agent = crate::api::tls_agent(Some(Duration::from_secs(20)), false)?;
     let resp = agent
-        .get(&file_url(&c.url))
+        .get(&url)
         .set("Authorization", &auth(c))
         .call()
         .map_err(fmt_err)
         .and_then(check)?;
     resp.into_string().map_err(|e| e.to_string())
+}
+
+/// Backup file names in the folder, newest first (names sort by timestamp).
+fn list(c: &Cred) -> Result<Vec<String>, String> {
+    let agent = crate::api::tls_agent(Some(Duration::from_secs(20)), false)?;
+    let resp = agent
+        .request("PROPFIND", folder(&c.url))
+        .set("Authorization", &auth(c))
+        .set("Depth", "1")
+        .call()
+        .map_err(fmt_err)
+        .and_then(check)?;
+    let xml = resp.into_string().map_err(|e| e.to_string())?;
+    let mut names: Vec<String> = xml
+        .split("href>")
+        .filter_map(|seg| seg.find("</").map(|end| &seg[..end]))
+        .filter_map(|href| href.trim_end_matches('/').rsplit('/').next())
+        .filter(|n| n.starts_with("cue-settings") && n.ends_with(".toml"))
+        .map(String::from)
+        .collect();
+    names.sort();
+    names.dedup();
+    names.reverse();
+    Ok(names)
 }
 
 pub fn backup(c: Cred, body: String, tx: Sender<Done>, ctx: eframe::egui::Context) {
@@ -73,9 +121,17 @@ pub fn backup(c: Cred, body: String, tx: Sender<Done>, ctx: eframe::egui::Contex
     });
 }
 
-pub fn restore(c: Cred, tx: Sender<Done>, ctx: eframe::egui::Context) {
+/// name = "" restores the url itself (single-file mode).
+pub fn restore(c: Cred, name: String, tx: Sender<Done>, ctx: eframe::egui::Context) {
     std::thread::spawn(move || {
-        let _ = tx.send(Done::Restore(get(&c)));
+        let _ = tx.send(Done::Restore(get(&c, &name)));
+        ctx.request_repaint();
+    });
+}
+
+pub fn list_backups(c: Cred, tx: Sender<Done>, ctx: eframe::egui::Context) {
+    std::thread::spawn(move || {
+        let _ = tx.send(Done::List(list(&c)));
         ctx.request_repaint();
     });
 }

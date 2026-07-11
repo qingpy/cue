@@ -4,9 +4,11 @@ use windows_sys::Win32::Graphics::Gdi::{
     MonitorFromWindow,
 };
 use windows_sys::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
+use windows_sys::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    DispatchMessageW, GetMessageW, HWND_NOTOPMOST, HWND_TOPMOST, IsWindowVisible, MSG, SW_HIDE,
-    SW_SHOW, SetForegroundWindow, SetWindowPos, ShowWindow, TranslateMessage,
+    BringWindowToTop, DispatchMessageW, GetForegroundWindow, GetMessageW, GetWindowThreadProcessId,
+    HWND_NOTOPMOST, HWND_TOPMOST, IsWindowVisible, MSG, SW_HIDE, SW_SHOW, SetForegroundWindow,
+    SetWindowPos, ShowWindow, TranslateMessage,
 };
 
 pub type Hwnd = isize;
@@ -42,7 +44,27 @@ fn place(hwnd: Hwnd, x: i32, y: i32, w: i32, h: i32, topmost: bool) {
         let after = if topmost { HWND_TOPMOST } else { HWND_NOTOPMOST };
         SetWindowPos(raw(hwnd), after, x, y, w, h, 0);
         ShowWindow(raw(hwnd), SW_SHOW);
-        SetForegroundWindow(raw(hwnd));
+        force_foreground(hwnd);
+    }
+}
+
+/// SetForegroundWindow alone is denied the first time a background process
+/// tries to take focus (Windows foreground lock); the window then shows
+/// without focus and the focus-loss auto-hide never arms. Briefly attaching
+/// to the current foreground thread's input queue bypasses the lock.
+fn force_foreground(hwnd: Hwnd) {
+    unsafe {
+        let fg = GetForegroundWindow();
+        let fg_thread = GetWindowThreadProcessId(fg, std::ptr::null_mut());
+        let our_thread = GetCurrentThreadId();
+        if fg_thread != 0 && fg_thread != our_thread {
+            AttachThreadInput(fg_thread, our_thread, 1);
+            BringWindowToTop(raw(hwnd));
+            SetForegroundWindow(raw(hwnd));
+            AttachThreadInput(fg_thread, our_thread, 0);
+        } else {
+            SetForegroundWindow(raw(hwnd));
+        }
     }
 }
 
