@@ -6,20 +6,20 @@ edition = "2024"
 [dependencies]
 arboard = { version = "3.6.1", default-features = false }
 base64 = "0.22.1"
-eframe = { version = "0.35", default-features = false, features = ["glow", "default_fonts"] }
-egui_commonmark = { version = "0.24.0", default-features = false, features = ["pulldown_cmark"] }
 enigo = "0.6.1"
 global-hotkey = "0.8.0"
 native-tls = "0.2.18"
-raw-window-handle = "0.6"
+pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
+tao = "0.35"
 toml = "1.1.2"
 tray-icon = "0.24.1"
 ureq = { version = "2.12", default-features = false, features = ["native-tls"] }
 windows = { version = "0.61", features = ["Win32_UI_Accessibility", "Win32_System_Com", "Win32_Foundation"] }
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_Graphics_Gdi", "Win32_UI_HiDpi", "Win32_System_SystemInformation", "Win32_System_Threading"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_UI_Shell", "Win32_Graphics_Gdi", "Win32_UI_HiDpi", "Win32_System_SystemInformation", "Win32_System_Threading"] }
 winreg = "0.56.0"
+wry = "0.55"
 
 [profile.release]
 lto = true

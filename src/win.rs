@@ -7,8 +7,8 @@ use windows_sys::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 use windows_sys::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     BringWindowToTop, DispatchMessageW, GetForegroundWindow, GetMessageW, GetWindowThreadProcessId,
-    HWND_NOTOPMOST, HWND_TOPMOST, IsWindowVisible, MSG, SW_HIDE, SW_SHOW, SetForegroundWindow,
-    SetWindowPos, ShowWindow, TranslateMessage,
+    HWND_NOTOPMOST, HWND_TOPMOST, MSG, SW_HIDE, SW_SHOW, SetForegroundWindow, SetWindowPos,
+    ShowWindow, TranslateMessage,
 };
 
 pub type Hwnd = isize;
@@ -24,8 +24,15 @@ pub fn hide(hwnd: Hwnd) {
     }
 }
 
-pub fn is_visible(hwnd: Hwnd) -> bool {
-    unsafe { IsWindowVisible(raw(hwnd)) != 0 }
+/// Whether the foreground window belongs to this process; the webview child
+/// holding focus must not count as "focus left the app".
+pub fn foreground_is_ours() -> bool {
+    unsafe {
+        let fg = GetForegroundWindow();
+        let mut pid = 0u32;
+        GetWindowThreadProcessId(fg, &mut pid);
+        pid == windows_sys::Win32::System::Threading::GetCurrentProcessId()
+    }
 }
 
 /// Scale of the target monitor, not the window's current one - they differ

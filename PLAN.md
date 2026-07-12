@@ -1,8 +1,9 @@
 # cue — architecture (as built)
 
 Minimalist Windows selection assistant: one hotkey, one window, one config
-file. Rust + eframe/egui 0.35, single ~6 MB exe. Flat square style: no
-rounded corners, hairline borders, Inter (embedded) + system CJK fallback.
+file. Rust + tao/wry (system WebView2 renders the UI, giving browser-native
+text selection in responses), ~1.7 MB exe + WebView2Loader.dll. Flat square
+style: no rounded corners, hairline borders, Segoe UI + system CJK fallback.
 
 ## Behavior
 
@@ -45,21 +46,30 @@ rounded corners, hairline borders, Inter (embedded) + system CJK fallback.
 
 ## Structure
 
-| File         | Role                                                         |
-|--------------|--------------------------------------------------------------|
-| `main.rs`    | eframe launch; window boots hidden off-screen (eframe force- |
-|              | shows after the first frame; the UI re-hides unwanted shows) |
-| `ui.rs`      | App state machine: assist/settings modes, streaming, drafts  |
-| `hotkey.rs`  | dedicated Win32 thread: global hotkey, tray icon, shows the  |
-|              | window via HWND (eframe skips hidden windows' UI entirely)   |
-| `config.rs`  | TOML schema, template, secrets, autostart registry sync      |
-| `api.rs`     | OpenAI-compatible SSE streaming client (ureq + schannel TLS) |
-| `dav.rs`     | WebDAV PUT/GET with Basic auth                               |
-| `capture.rs` | clipboard-based selection capture, cursor position (enigo)   |
-| `win.rs`     | ShowWindow/SetWindowPos, per-monitor DPI, message pump       |
-| `font.rs`    | embedded Inter + runtime system CJK fallback                 |
+| File             | Role                                                        |
+|------------------|-------------------------------------------------------------|
+| `main.rs`        | tao event loop; single `Ev::Wake` user event                |
+| `ui.rs`          | window + WebView2, ipc dispatch, streaming, dav, settings   |
+| `assets/ui.html` | the whole UI: assist + settings views, styling, page logic  |
+| `hotkey.rs`      | dedicated Win32 thread: global hotkey, tray icon, shows the |
+|                  | window via HWND, wakes the event loop                       |
+| `config.rs`      | TOML schema, template, secrets, autostart registry sync     |
+| `api.rs`         | OpenAI-compatible SSE streaming client (ureq + schannel TLS)|
+| `dav.rs`         | WebDAV PUT/GET with Basic auth                              |
+| `capture.rs`     | UIA/clipboard selection capture, cursor position (enigo)    |
+| `win.rs`         | ShowWindow/SetWindowPos, per-monitor DPI, message pump      |
 
-Deps: eframe, egui_commonmark, global-hotkey, tray-icon, arboard, enigo,
-ureq/native-tls (schannel), base64, serde/serde_json/toml, windows-sys,
-raw-window-handle, winreg. Build with `build.ps1` (w64devkit supplies the
-binutils the windows-gnu toolchain lacks).
+UI split: Rust owns all state and logic; the page renders it. Rust calls page
+functions (`assist`, `settings`, `resp`, `notice`, `davlist`, ...) via
+`evaluate_script` with JSON-literal arguments; the page posts `{cmd, ...}`
+ipc messages (`run`, `followup`, `save`, `drag`, `close`, ...). Markdown is
+converted to HTML in Rust (pulldown-cmark; raw HTML neutralized to text) and
+set as `innerHTML`, so responses select/copy like any web page. Unsaved
+settings edits live in the page (`dirty`) and survive assist activations.
+WebView2 profile data lives in `%APPDATA%\cue\webview2`.
+
+Deps: tao, wry, pulldown-cmark, global-hotkey, tray-icon, arboard, enigo,
+ureq/native-tls (schannel), base64, serde/serde_json/toml, windows,
+windows-sys, winreg. Build with `build.ps1` (w64devkit supplies the binutils
+the windows-gnu toolchain lacks; it also copies WebView2Loader.dll beside the
+exe - a hard import, the app won't start without it).

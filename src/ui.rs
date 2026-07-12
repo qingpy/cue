@@ -1,19 +1,14 @@
 use crate::hotkey::Msg;
-use crate::{api, config, dav, hotkey, win};
-use eframe::egui::{
-    Align2, Button, CentralPanel, Color32, Context, CornerRadius, DragValue, FontId, Frame, Id,
-    Key, LayerId, Margin, Modifiers, Order, Panel, RichText, ScrollArea, Sense, Stroke,
-    StrokeKind, TextEdit, Theme, Ui, ViewportCommand, vec2,
-};
-use egui_commonmark::{CommonMarkCache, CommonMarkViewer};
-use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+use crate::{Ev, api, config, dav, hotkey, win};
+use serde_json::{Value, json};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, channel};
-
-const BG: Color32 = Color32::from_rgb(250, 250, 249);
-const BORDER: Color32 = Color32::from_rgb(160, 160, 155);
-const WEAK: Color32 = Color32::from_rgb(130, 130, 125);
+use tao::event::{Event, WindowEvent};
+use tao::event_loop::{ControlFlow, EventLoop, EventLoopProxy};
+use tao::platform::windows::WindowExtWindows;
+use tao::window::{Window, WindowBuilder};
+use wry::WebViewBuilder;
 
 #[derive(PartialEq)]
 enum Mode {
@@ -21,19 +16,9 @@ enum Mode {
     Settings,
 }
 
-struct DraftAction {
-    name: String,
-    prompt: String,
-    model: String,
-    /// None = inherit the global; the checkbox shows the effective value and
-    /// toggling it pins an explicit override
-    reasoning: Option<bool>,
-    base_url: Option<String>,
-    api_key: Option<String>,
-    key: Option<String>,
-}
-
-struct Draft {
+/// Settings form as the page submits it.
+#[derive(serde::Deserialize)]
+struct Form {
     hotkey: String,
     autostart: bool,
     width: f32,
@@ -45,121 +30,82 @@ struct Draft {
     dav_url: String,
     dav_user: String,
     dav_pass: String,
-    actions: Vec<DraftAction>,
-    expanded: Option<usize>,
-    focus_expanded: bool,
+    actions: Vec<FormAction>,
 }
 
-impl Draft {
-    fn from(cfg: &config::Config) -> Self {
-        let name = cfg.api.key_name();
-        Self {
-            hotkey: cfg.hotkey.clone(),
-            autostart: cfg.autostart,
-            width: cfg.width,
-            height: cfg.height,
-            base_url: cfg.api.base_url.clone(),
-            model: cfg.api.model.clone(),
-            reasoning: cfg.api.reasoning,
-            secret: cfg.secrets.get(name).cloned().unwrap_or_default(),
-            dav_url: cfg.webdav.url.clone(),
-            dav_user: cfg.webdav.user.clone(),
-            dav_pass: cfg.secrets.get("webdav").cloned().unwrap_or_default(),
-            actions: cfg
-                .actions
-                .iter()
-                .map(|a| DraftAction {
-                    name: a.name.clone(),
-                    prompt: a.prompt.clone(),
-                    model: a.model.clone().unwrap_or_default(),
-                    reasoning: a.reasoning,
-                    base_url: a.base_url.clone(),
-                    api_key: a.api_key.clone(),
-                    key: a.key.clone(),
-                })
-                .collect(),
-            expanded: None,
-            focus_expanded: false,
-        }
-    }
+#[derive(serde::Deserialize)]
+struct FormAction {
+    name: String,
+    prompt: String,
+    model: String,
+    reasoning: Option<bool>,
+    base_url: Option<String>,
+    api_key: Option<String>,
+    key: Option<String>,
 }
 
 pub struct App {
+    window: Window,
+    webview: wry::WebView,
+    _web_context: wry::WebContext,
     hwnd: win::Hwnd,
+    proxy: EventLoopProxy<Ev>,
+    ipc_rx: Receiver<Value>,
     act_rx: Receiver<Msg>,
     startup_hotkey: String,
+    /// welcome/error notes shown once the page reports ready
+    startup_notice: Option<String>,
     cfg: config::Config,
     mode: Mode,
-    draft: Option<Draft>,
-    notice: Option<String>,
-    input: String,
-    focus_input: bool,
-    input_expanded: bool,
-    followup: String,
     response: String,
     transcript: String,
-    messages: Vec<serde_json::Value>,
+    messages: Vec<Value>,
     endpoint: Option<api::Endpoint>,
     streaming: bool,
     rx: Option<Receiver<api::Delta>>,
     abort: Arc<AtomicBool>,
-    cache: CommonMarkCache,
-    had_focus: bool,
-    want_visible: bool,
     dav_rx: Option<Receiver<dav::Done>>,
-    dav_list: Option<Vec<String>>,
+    /// credentials of an in-flight restore, merged into the restored config
+    dav_cred: Option<(String, String, String)>,
+    had_focus: bool,
+    /// focus the empty input once, on the first tick after the foreground
+    /// lands: repeated MoveFocus calls blur (and re-fold) the input the page
+    /// just focused, and calling it before the foreground arrives is a no-op
+    focus_pending: bool,
 }
 
-fn square_style(ctx: &Context) {
-    ctx.all_styles_mut(|s| {
-        let v = &mut s.visuals;
-        for w in [
-            &mut v.widgets.noninteractive,
-            &mut v.widgets.inactive,
-            &mut v.widgets.hovered,
-            &mut v.widgets.active,
-            &mut v.widgets.open,
-        ] {
-            w.corner_radius = CornerRadius::ZERO;
-        }
-        v.window_corner_radius = CornerRadius::ZERO;
-        v.menu_corner_radius = CornerRadius::ZERO;
-        v.panel_fill = BG;
-        v.extreme_bg_color = Color32::WHITE;
+/// Markdown to HTML. Raw HTML in model output is neutralized to text: the
+/// page runs with an ipc bridge, so the response must stay inert markup.
+fn md_html(text: &str) -> String {
+    use pulldown_cmark::{Event, Options, Parser, html};
+    let opts = Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TABLES | Options::ENABLE_TASKLISTS;
+    let parser = Parser::new_ext(text, opts).map(|ev| match ev {
+        Event::Html(h) => Event::Text(h),
+        Event::InlineHtml(h) => Event::Text(h),
+        ev => ev,
     });
+    let mut out = String::new();
+    html::push_html(&mut out, parser);
+    out
 }
 
-/// Title strip: draggable, with a close (hide) button. Returns close clicked.
-fn drag_header(ui: &mut Ui, ctx: &Context, title: &str) -> bool {
-    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 16.0), Sense::hover());
-    let drag_rect = rect.with_max_x(rect.right() - 24.0);
-    let drag = ui.interact(drag_rect, ui.id().with("drag"), Sense::click_and_drag());
-    if drag.drag_started() {
-        ctx.send_viewport_cmd(ViewportCommand::StartDrag);
+fn open_url(url: &str) {
+    if !(url.starts_with("https://") || url.starts_with("http://")) {
+        return;
     }
-    let x_rect = eframe::egui::Rect::from_center_size(
-        eframe::egui::pos2(rect.right() - 8.0, rect.center().y),
-        vec2(16.0, 16.0),
-    );
-    let x = ui.interact(x_rect, ui.id().with("close"), Sense::click());
-    let p = ui.painter();
-    p.text(rect.left_center(), Align2::LEFT_CENTER, title, FontId::monospace(11.0), WEAK);
-    let x_color = if x.hovered() { Color32::from_rgb(40, 40, 38) } else { WEAK };
-    p.text(x_rect.center(), Align2::CENTER_CENTER, "×", FontId::proportional(14.0), x_color);
-    x.clicked()
-}
-
-fn section(ui: &mut Ui, label: &str) {
-    ui.add_space(10.0);
-    ui.label(RichText::new(label).monospace().size(10.0).color(WEAK));
-    ui.add_space(2.0);
-}
-
-/// First non-empty line, with an ellipsis when more follows.
-fn one_line(text: &str) -> String {
-    let mut lines = text.lines().filter(|l| !l.trim().is_empty());
-    let first = lines.next().unwrap_or("").to_string();
-    if lines.next().is_some() { format!("{first} ...") } else { first }
+    use windows_sys::Win32::UI::Shell::ShellExecuteW;
+    let op: Vec<u16> = "open".encode_utf16().chain([0]).collect();
+    let wide: Vec<u16> = url.encode_utf16().chain([0]).collect();
+    unsafe {
+        ShellExecuteW(
+            std::ptr::null_mut(),
+            op.as_ptr(),
+            wide.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            1, // SW_SHOWNORMAL
+        );
+    }
 }
 
 fn restart() -> ! {
@@ -170,15 +116,34 @@ fn restart() -> ! {
 }
 
 impl App {
-    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        let ctx = &cc.egui_ctx;
-        ctx.set_theme(Theme::Light);
-        square_style(ctx);
-        crate::font::install(ctx);
+    pub fn new(event_loop: &EventLoop<Ev>) -> Self {
+        let proxy = event_loop.create_proxy();
+        let window = WindowBuilder::new()
+            .with_title("cue")
+            .with_inner_size(tao::dpi::LogicalSize::new(560.0, 600.0))
+            .with_decorations(false)
+            .with_always_on_top(true)
+            .with_visible(false)
+            .build(event_loop)
+            .expect("window");
+        let hwnd = window.hwnd() as win::Hwnd;
 
-        let hwnd: win::Hwnd = match cc.window_handle().map(|h| h.as_raw()) {
-            Ok(RawWindowHandle::Win32(h)) => h.hwnd.get(),
-            _ => 0,
+        let data_dir = config::secrets_path().with_file_name("webview2");
+        let mut web_context = wry::WebContext::new(Some(data_dir));
+        let (ipc_tx, ipc_rx) = channel::<Value>();
+        let webview = {
+            let proxy = proxy.clone();
+            WebViewBuilder::new_with_web_context(&mut web_context)
+                .with_background_color((250, 250, 249, 255))
+                .with_html(include_str!("../assets/ui.html"))
+                .with_ipc_handler(move |req| {
+                    if let Ok(v) = serde_json::from_str::<Value>(req.body()) {
+                        let _ = ipc_tx.send(v);
+                        let _ = proxy.send_event(Ev::Wake);
+                    }
+                })
+                .build(&window)
+                .expect("webview")
         };
 
         let mut notes: Vec<String> = Vec::new();
@@ -192,7 +157,7 @@ impl App {
         config::sync_autostart(cfg.autostart);
 
         let (act_tx, act_rx) = channel();
-        if let Some(e) = hotkey::spawn(hwnd, ctx.clone(), &cfg, act_tx) {
+        if let Some(e) = hotkey::spawn(hwnd, proxy.clone(), &cfg, act_tx) {
             notes.push(e);
         }
         if created {
@@ -202,43 +167,26 @@ impl App {
             ));
         }
 
-        // First run or broken config: surface the window. Delayed so eframe
-        // finishes window setup first (the UI of hidden windows never runs,
-        // so this can't be done from the update loop).
         let log = config::path().with_file_name("cue.log");
         if notes.is_empty() {
             let _ = std::fs::remove_file(log);
-            // guarantee a frame after eframe's forced first show, so the
-            // want_visible enforcement below can re-hide the window
-            let wake = ctx.clone();
-            std::thread::spawn(move || {
-                std::thread::sleep(std::time::Duration::from_millis(300));
-                wake.request_repaint();
-            });
         } else {
             let _ = std::fs::write(log, notes.join("\n"));
-            let wake = ctx.clone();
-            let size = cfg.size();
-            std::thread::spawn(move || {
-                std::thread::sleep(std::time::Duration::from_millis(400));
-                win::show_centered(hwnd, size, true);
-                wake.request_repaint();
-            });
+            win::show_centered(hwnd, cfg.size(), true);
         }
 
         Self {
+            window,
+            webview,
+            _web_context: web_context,
             hwnd,
+            proxy,
+            ipc_rx,
             act_rx,
             startup_hotkey: cfg.hotkey.clone(),
-            want_visible: !notes.is_empty(),
-            notice: (!notes.is_empty()).then(|| notes.join("\n")),
+            startup_notice: (!notes.is_empty()).then(|| notes.join("\n")),
             cfg,
             mode: Mode::Assist,
-            draft: None,
-            input: String::new(),
-            focus_input: false,
-            input_expanded: false,
-            followup: String::new(),
             response: String::new(),
             transcript: String::new(),
             messages: Vec::new(),
@@ -246,139 +194,182 @@ impl App {
             streaming: false,
             rx: None,
             abort: Arc::new(AtomicBool::new(false)),
-            cache: CommonMarkCache::default(),
-            had_focus: false,
             dav_rx: None,
-            dav_list: None,
+            dav_cred: None,
+            had_focus: false,
+            focus_pending: false,
         }
     }
 
-    fn dav_cred(d: &Draft) -> dav::Cred {
-        dav::Cred {
-            url: d.dav_url.trim().to_string(),
-            user: d.dav_user.trim().to_string(),
-            pass: d.dav_pass.clone(),
+    pub fn handle(&mut self, event: Event<Ev>, flow: &mut ControlFlow) {
+        *flow = ControlFlow::Wait;
+        if let Event::WindowEvent { event: WindowEvent::CloseRequested, .. } = event {
+            self.hide();
         }
-    }
-
-    fn poll_dav(&mut self) {
-        let Some(rx) = self.dav_rx.take() else { return };
-        match rx.try_recv() {
-            Ok(dav::Done::Backup(Ok(()))) => {
-                self.dav_list = None; // refetch so the new backup shows
-                self.notice = Some("backup uploaded".into());
+        while let Ok(v) = self.ipc_rx.try_recv() {
+            self.on_ipc(v);
+        }
+        while let Ok(msg) = self.act_rx.try_recv() {
+            match msg {
+                Msg::Activate(text) => self.activate(text),
+                Msg::Settings => self.open_settings(),
             }
-            Ok(dav::Done::Backup(Err(e))) => self.notice = Some(format!("backup failed: {e}")),
-            Ok(dav::Done::Restore(Ok(body))) => match toml::from_str::<config::Config>(&body) {
-                Ok(mut c) => {
-                    // a restore must not lose the webdav connection it was
-                    // performed with, even if the backup predates it
-                    let (url, user, pass) = match &self.draft {
-                        Some(d) => {
-                            let c = Self::dav_cred(d);
-                            (c.url, c.user, c.pass)
-                        }
-                        None => (
-                            self.cfg.webdav.url.clone(),
-                            self.cfg.webdav.user.clone(),
-                            self.cfg.secrets.get("webdav").cloned().unwrap_or_default(),
-                        ),
-                    };
-                    if c.webdav.url.is_empty() {
-                        c.webdav.url = url;
-                        c.webdav.user = user;
-                    }
-                    let merged = toml::to_string_pretty(&c).unwrap_or(body);
-                    let _ = config::save_raw(&merged);
-                    if let Ok((cfg, _)) = config::load() {
-                        self.cfg = cfg;
-                    }
-                    if self.mode == Mode::Settings {
-                        let mut d = Draft::from(&self.cfg);
-                        if d.dav_pass.is_empty() {
-                            d.dav_pass = pass;
-                        }
-                        self.draft = Some(d);
-                    }
-                    self.notice = Some("restored from webdav".into());
+        }
+        self.poll_stream();
+        self.poll_dav();
+        // auto-hide once focus moves to another app (assist only: settings
+        // should survive a trip to the browser to copy an api key). Polled,
+        // because Win32 focus lives on the webview child, not on this window,
+        // so tao never reports focus changes. had_focus guards the moments
+        // between showing and SetForegroundWindow landing.
+        if self.mode == Mode::Assist && self.window.is_visible() {
+            if win::foreground_is_ours() {
+                self.had_focus = true;
+            } else if self.had_focus {
+                self.had_focus = false;
+                self.hide();
+                return;
+            }
+            if self.focus_pending && self.had_focus {
+                self.focus_pending = false;
+                let _ = self.webview.focus();
+                let _ = self.webview.evaluate_script("document.getElementById('inp').focus()");
+            }
+            let wake = std::time::Instant::now() + std::time::Duration::from_millis(150);
+            *flow = ControlFlow::WaitUntil(wake);
+        }
+    }
+
+    /// evaluate `func(...args)` in the page; JSON doubles as JS literals
+    fn call(&self, func: &str, args: &[Value]) {
+        let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+        let _ = self.webview.evaluate_script(&format!("{func}({})", args.join(",")));
+    }
+
+    fn notice(&self, text: &str) {
+        self.call("notice", &[json!(text)]);
+    }
+
+    fn on_ipc(&mut self, v: Value) {
+        match v["cmd"].as_str().unwrap_or("") {
+            "ready" => {
+                if let Some(n) = self.startup_notice.take() {
+                    let names: Vec<&str> = self.cfg.actions.iter().map(|a| a.name.as_str()).collect();
+                    self.call("assist", &[json!(""), json!(names), json!(n), json!(true)]);
                 }
-                Err(e) => self.notice = Some(format!("restore: not a valid config: {e}")),
+            }
+            "drag" => {
+                let _ = self.window.drag_window();
+            }
+            "close" => self.close(),
+            "run" => {
+                let idx = v["idx"].as_u64().unwrap_or(0) as usize;
+                let input = v["input"].as_str().unwrap_or("").to_string();
+                self.run_action(idx, &input);
+            }
+            "followup" => {
+                let q = v["text"].as_str().unwrap_or("").trim().to_string();
+                self.send_followup(q);
+            }
+            "copy" => {
+                if !self.response.is_empty()
+                    && let Ok(mut cb) = arboard::Clipboard::new()
+                {
+                    let _ = cb.set_text(self.response.clone());
+                }
+            }
+            "copytext" => {
+                if let (Some(t), Ok(mut cb)) = (v["text"].as_str(), arboard::Clipboard::new()) {
+                    let _ = cb.set_text(t.to_string());
+                }
+            }
+            "open" => open_url(v["url"].as_str().unwrap_or("")),
+            "save" => match serde_json::from_value::<Form>(v["form"].clone()) {
+                Ok(f) => self.save(f),
+                Err(e) => self.notice(&format!("save failed: {e}")),
             },
-            Ok(dav::Done::Restore(Err(e))) => self.notice = Some(format!("restore failed: {e}")),
-            Ok(dav::Done::List(Ok(names))) => {
-                if names.is_empty() {
-                    self.notice = Some("no backups found".into());
-                } else {
-                    self.dav_list = Some(names);
-                }
-            }
-            Ok(dav::Done::List(Err(e))) => self.notice = Some(format!("list failed: {e}")),
-            Err(std::sync::mpsc::TryRecvError::Empty) => self.dav_rx = Some(rx),
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => {}
+            "backup" | "davlist" | "restore" => self.dav_op(&v),
+            _ => {}
         }
     }
 
     /// Window is already visible (hotkey/tray thread showed it); reset state
-    /// around the captured text and reload the config. An unsaved settings
-    /// draft is kept in the background and restored on the next settings open.
+    /// around the captured text and reload the config. Unsaved settings edits
+    /// stay in the page and reappear on the next settings open.
     fn activate(&mut self, text: String) {
         self.abort.store(true, Ordering::Relaxed);
         self.mode = Mode::Assist;
+        let mut notice = String::new();
         match config::load() {
             Ok((cfg, _)) => {
                 config::sync_autostart(cfg.autostart);
-                self.notice = (cfg.hotkey != self.startup_hotkey)
-                    .then(|| "hotkey changed - restart cue to apply".to_string());
+                if cfg.hotkey != self.startup_hotkey {
+                    notice = "hotkey changed - restart cue to apply".into();
+                }
                 self.cfg = config::Config { hotkey: self.startup_hotkey.clone(), ..cfg };
             }
-            Err(e) => self.notice = Some(e),
+            Err(e) => notice = e,
         }
-        // with captured text, show a folded preview and keep focus on the
-        // window so number keys fire; with nothing captured, expand the input
-        // with the caret in it for typing
-        self.input_expanded = text.is_empty();
-        self.focus_input = text.is_empty();
-        self.input = text;
-        self.had_focus = false;
         self.response.clear();
         self.transcript.clear();
-        self.followup.clear();
         self.messages.clear();
         self.streaming = false;
         self.rx = None;
+        self.had_focus = false;
+        // with captured text, keep focus free so number keys fire; with
+        // nothing captured, expand the input with the caret in it
+        let expand = text.is_empty();
+        let names: Vec<&str> = self.cfg.actions.iter().map(|a| a.name.as_str()).collect();
+        self.call("assist", &[json!(text), json!(names), json!(notice), json!(expand)]);
+        self.focus_pending = expand;
     }
 
     fn open_settings(&mut self) {
-        self.dav_list = None;
-        if self.draft.is_none() {
-            if let Ok((cfg, _)) = config::load() {
-                self.cfg = cfg;
-            }
-            self.draft = Some(Draft::from(&self.cfg));
+        if let Ok((cfg, _)) = config::load() {
+            self.cfg = cfg;
         }
         self.mode = Mode::Settings;
         self.had_focus = false;
-        self.notice = None;
+        self.call("settings", &[self.settings_payload(None), json!(false)]);
+        let _ = self.webview.focus();
     }
 
-    fn save_settings(&mut self) {
-        let Some(d) = self.draft.take() else { return };
+    fn settings_payload(&self, dav_pass: Option<&str>) -> Value {
+        let c = &self.cfg;
+        let secret = |n: &str| c.secrets.get(n).cloned().unwrap_or_default();
+        json!({
+            "hotkey": c.hotkey, "autostart": c.autostart,
+            "width": c.width, "height": c.height,
+            "base_url": c.api.base_url, "model": c.api.model, "reasoning": c.api.reasoning,
+            "secret": secret(c.api.key_name()),
+            "dav_url": c.webdav.url, "dav_user": c.webdav.user,
+            "dav_pass": dav_pass.map(String::from).unwrap_or_else(|| secret("webdav")),
+            "actions": c.actions.iter().map(|a| json!({
+                "name": a.name, "prompt": a.prompt,
+                "model": a.model.clone().unwrap_or_default(),
+                "reasoning": a.reasoning,
+                "base_url": a.base_url, "api_key": a.api_key, "key": a.key,
+            })).collect::<Vec<_>>(),
+        })
+    }
+
+    fn save(&mut self, f: Form) {
         let mut cfg = self.cfg.clone();
-        cfg.hotkey = d.hotkey.trim().to_string();
-        cfg.autostart = d.autostart;
-        cfg.width = d.width;
-        cfg.height = d.height;
-        cfg.api.base_url = d.base_url.trim().to_string();
-        cfg.api.model = d.model.trim().to_string();
-        cfg.api.reasoning = d.reasoning;
-        cfg.webdav.url = d.dav_url.trim().to_string();
-        cfg.webdav.user = d.dav_user.trim().to_string();
-        let dav_pass = d.dav_pass;
-        // unnamed actions can't be saved; keep them in the form, don't erase
-        let (named, unnamed): (Vec<_>, Vec<_>) =
-            d.actions.into_iter().partition(|a| !a.name.trim().is_empty());
-        cfg.actions = named
+        cfg.hotkey = f.hotkey.trim().to_string();
+        cfg.autostart = f.autostart;
+        cfg.width = f.width.clamp(200.0, 2000.0);
+        cfg.height = f.height.clamp(150.0, 2000.0);
+        cfg.api.base_url = f.base_url.trim().to_string();
+        cfg.api.model = f.model.trim().to_string();
+        cfg.api.reasoning = f.reasoning;
+        cfg.webdav.url = f.dav_url.trim().to_string();
+        cfg.webdav.user = f.dav_user.trim().to_string();
+        // unnamed actions can't be saved; they stay in the form for naming
+        let unnamed = f.actions.iter().any(|a| a.name.trim().is_empty());
+        cfg.actions = f
+            .actions
             .into_iter()
+            .filter(|a| !a.name.trim().is_empty())
             .map(|a| config::Action {
                 name: a.name.trim().to_string(),
                 prompt: a.prompt,
@@ -387,7 +378,7 @@ impl App {
                     (!m.is_empty()).then(|| m.to_string())
                 },
                 // an override equal to the global collapses to inherit
-                reasoning: a.reasoning.filter(|v| *v != d.reasoning),
+                reasoning: a.reasoning.filter(|v| *v != f.reasoning),
                 base_url: a.base_url,
                 api_key: a.api_key,
                 key: a.key,
@@ -395,13 +386,13 @@ impl App {
             .collect();
 
         let name = cfg.api.key_name().to_string();
-        let secret = d.secret.trim().to_string();
+        let secret = f.secret.trim().to_string();
         let mut err = config::set_secret(&name, &secret).err();
         cfg.secrets.insert(name, secret);
-        if let Err(e) = config::set_secret("webdav", &dav_pass) {
+        if let Err(e) = config::set_secret("webdav", &f.dav_pass) {
             err = Some(e);
         }
-        cfg.secrets.insert("webdav".into(), dav_pass);
+        cfg.secrets.insert("webdav".into(), f.dav_pass);
         if let Err(e) = config::save(&cfg) {
             err = Some(e);
         }
@@ -412,26 +403,33 @@ impl App {
         }
 
         // stay open in settings after save; cancel/Esc/x close
-        self.notice = Some(match err {
-            Some(e) => e,
-            None if unnamed.is_empty() => "saved".into(),
-            None => "saved - give the unnamed action a name".into(),
-        });
         self.cfg = cfg;
-        let mut fresh = Draft::from(&self.cfg);
-        fresh.actions.extend(unnamed);
-        self.draft = Some(fresh);
+        let notice = match err {
+            Some(e) => e,
+            None if unnamed => "saved - give the unnamed action a name".into(),
+            None => "saved".to_string(),
+        };
+        self.call("saved", &[json!(notice)]);
+    }
+
+    fn close(&mut self) {
+        if self.mode == Mode::Settings {
+            // discard the draft; Esc paths reach here with dirty still set
+            let _ = self.webview.evaluate_script("dirty=false");
+            self.mode = Mode::Assist;
+        }
+        self.hide();
     }
 
     fn hide(&mut self) {
         self.abort.store(true, Ordering::Relaxed);
         self.streaming = false;
         self.rx = None;
-        self.want_visible = false;
+        self.focus_pending = false;
         win::hide(self.hwnd);
     }
 
-    fn start_stream(&mut self, ctx: &Context) {
+    fn start_stream(&mut self) {
         let Some(ep) = self.endpoint.clone() else { return };
         self.abort.store(true, Ordering::Relaxed);
         self.abort = Arc::new(AtomicBool::new(false));
@@ -439,44 +437,59 @@ impl App {
         let (tx, rx) = channel();
         self.rx = Some(rx);
         self.streaming = true;
-        api::stream(ep, self.messages.clone(), tx, self.abort.clone(), ctx.clone());
+        api::stream(ep, self.messages.clone(), tx, self.abort.clone(), self.proxy.clone());
+        self.render_resp();
     }
 
-    fn run_action(&mut self, idx: usize, ctx: &Context) {
+    fn run_action(&mut self, idx: usize, input: &str) {
         let Some(a) = self.cfg.actions.get(idx) else { return };
-        let prompt = a.prompt.replace("{{text}}", self.input.trim());
+        let prompt = a.prompt.replace("{{text}}", input.trim());
         self.endpoint = Some(self.cfg.endpoint(a));
         self.messages = vec![api::user(&prompt)];
         self.transcript.clear();
-        self.start_stream(ctx);
+        self.start_stream();
     }
 
-    fn send_followup(&mut self, ctx: &Context) {
-        let q = self.followup.trim().to_string();
+    fn send_followup(&mut self, q: String) {
         if q.is_empty() || self.streaming || self.response.is_empty() {
             return;
         }
         self.messages.push(api::assistant(&self.response));
         self.messages.push(api::user(&q));
         self.transcript.push_str(&format!("{}\n\n---\n\n**{}**\n\n", self.response, q));
-        self.followup.clear();
-        self.start_stream(ctx);
+        self.start_stream();
+    }
+
+    fn render_resp(&self) {
+        let display = if self.transcript.is_empty() {
+            self.response.clone()
+        } else {
+            format!("{}{}", self.transcript, self.response)
+        };
+        let html = if display.is_empty() { String::new() } else { md_html(&display) };
+        self.call("resp", &[json!(html), json!(self.streaming)]);
     }
 
     fn poll_stream(&mut self) {
         let Some(rx) = self.rx.take() else { return };
+        let mut changed = false;
         let mut keep = true;
         loop {
             match rx.try_recv() {
-                Ok(api::Delta::Chunk(s)) => self.response.push_str(&s),
+                Ok(api::Delta::Chunk(s)) => {
+                    self.response.push_str(&s);
+                    changed = true;
+                }
                 Ok(api::Delta::Done) => {
                     self.streaming = false;
                     keep = false;
+                    changed = true;
                     break;
                 }
                 Ok(api::Delta::Error(e)) => {
                     self.streaming = false;
                     keep = false;
+                    changed = true;
                     self.response.push_str(&format!("\n\n**error:** {e}"));
                     break;
                 }
@@ -491,428 +504,96 @@ impl App {
         if keep {
             self.rx = Some(rx);
         }
-    }
-
-    fn assist_ui(&mut self, ui: &mut Ui, ctx: &Context) {
-        let pad = Frame::new().fill(BG).inner_margin(Margin::same(12));
-
-        let mut close = false;
-        Panel::top("head").frame(pad).show_separator_line(false).show(ui, |ui| {
-            close = drag_header(ui, ctx, "CUE");
-            ui.add_space(6.0);
-
-            // folds to a one-line preview when unfocused (captured text can be
-            // long); clicking expands it to the editor
-            let input_id = Id::new("assist-input");
-            if self.input_expanded {
-                // consume Enter before the TextEdit sees it, so it dispatches
-                // the action instead of inserting a newline at the caret
-                let enter = ctx.memory(|m| m.has_focus(input_id))
-                    && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Enter));
-                let te = ui.add(
-                    TextEdit::multiline(&mut self.input)
-                        .id(input_id)
-                        .desired_rows(2)
-                        .desired_width(f32::INFINITY)
-                        .hint_text("enter runs action 1"),
-                );
-                if self.focus_input {
-                    self.focus_input = false;
-                    te.request_focus();
-                }
-                if te.lost_focus() && !enter {
-                    self.input_expanded = false;
-                }
-                if enter {
-                    self.run_action(0, ctx);
-                }
-            } else {
-                let mut preview = one_line(&self.input);
-                let r = ui.add(
-                    TextEdit::singleline(&mut preview)
-                        .id(input_id.with("preview"))
-                        .desired_width(f32::INFINITY)
-                        .hint_text("enter runs action 1"),
-                );
-                if r.gained_focus() {
-                    self.input_expanded = true;
-                    self.focus_input = true;
-                }
-            }
-            ui.add_space(6.0);
-
-            ui.horizontal_wrapped(|ui| {
-                for i in 0..self.cfg.actions.len() {
-                    let label = format!("{} {}", i + 1, self.cfg.actions[i].name);
-                    let b = ui.button(label);
-                    if b.clicked() {
-                        // a focused button would swallow the number keys and
-                        // re-fire on Enter
-                        b.surrender_focus();
-                        self.run_action(i, ctx);
-                    }
-                }
-            });
-            const NUMS: [Key; 9] = [
-                Key::Num1, Key::Num2, Key::Num3, Key::Num4, Key::Num5,
-                Key::Num6, Key::Num7, Key::Num8, Key::Num9,
-            ];
-            if ctx.memory(|m| m.focused()).is_none() {
-                for (i, k) in NUMS.iter().enumerate().take(self.cfg.actions.len()) {
-                    if ctx.input(|inp| inp.key_pressed(*k)) {
-                        self.run_action(i, ctx);
-                    }
-                }
-            }
-            if let Some(n) = &self.notice {
-                ui.add_space(4.0);
-                ui.colored_label(WEAK, n);
-            }
-        });
-        if close {
-            self.hide();
+        if changed {
+            self.render_resp();
         }
-
-        Panel::bottom("foot").frame(pad).show_separator_line(false).show(ui, |ui| {
-            ui.horizontal(|ui| {
-                let has_resp = !self.response.is_empty();
-                if ui.add_enabled(has_resp, Button::new("copy")).clicked() {
-                    ctx.copy_text(self.response.clone());
-                }
-                let fu = ui.add_sized(
-                    vec2(ui.available_width(), 20.0),
-                    TextEdit::singleline(&mut self.followup).hint_text("follow up"),
-                );
-                if fu.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
-                    self.send_followup(ctx);
-                    fu.request_focus();
-                }
-            });
-        });
-
-        CentralPanel::default()
-            .frame(Frame::new().fill(BG).inner_margin(Margin::symmetric(12, 0)))
-            .show(ui, |ui| {
-                ScrollArea::vertical()
-                    .auto_shrink([false, false])
-                    .stick_to_bottom(true)
-                    .show(ui, |ui| {
-                        if self.transcript.is_empty() {
-                            if !self.response.is_empty() {
-                                CommonMarkViewer::new().show(ui, &mut self.cache, &self.response);
-                            }
-                        } else {
-                            let display = format!("{}{}", self.transcript, self.response);
-                            CommonMarkViewer::new().show(ui, &mut self.cache, &display);
-                        }
-                        if self.streaming {
-                            ui.spinner();
-                        }
-                    });
-            });
     }
 
-    fn settings_ui(&mut self, ui: &mut Ui, ctx: &Context) {
-        let pad = Frame::new().fill(BG).inner_margin(Margin::same(12));
-        let mut save = false;
-        let mut cancel = false;
-        let mut do_backup = false;
-        let mut do_restore = false;
-        let mut do_list = false;
-        let mut restore_pick: Option<String> = None;
-        let dav_idle = self.dav_rx.is_none();
-        let dav_list = self.dav_list.clone();
-
-        Panel::top("shead").frame(pad).show_separator_line(false).show(ui, |ui| {
-            cancel = drag_header(ui, ctx, "CUE · SETTINGS");
-        });
-
-        Panel::bottom("sfoot").frame(pad).show_separator_line(false).show(ui, |ui| {
-            ui.horizontal(|ui| {
-                save = ui.button("save").clicked();
-                cancel |= ui.button("cancel").clicked();
-            });
-            if let Some(n) = &self.notice {
-                ui.colored_label(WEAK, n);
+    fn dav_op(&mut self, v: &Value) {
+        if self.dav_rx.is_some() {
+            return; // one operation at a time
+        }
+        let cred = dav::Cred {
+            url: v["dav"]["url"].as_str().unwrap_or("").trim().to_string(),
+            user: v["dav"]["user"].as_str().unwrap_or("").trim().to_string(),
+            pass: v["dav"]["pass"].as_str().unwrap_or("").to_string(),
+        };
+        if cred.url.is_empty() {
+            return;
+        }
+        let (tx, rx) = channel();
+        match v["cmd"].as_str().unwrap_or("") {
+            "backup" => {
+                // back up the saved state on disk (sanitized), but carry the
+                // webdav connection currently typed in the form - otherwise a
+                // backup made before saving uploads a config without it, and
+                // a later restore wipes the fields
+                let (url, user) = (cred.url.clone(), cred.user.clone());
+                match config::load().and_then(|(mut c, _)| {
+                    c.webdav.url = url;
+                    c.webdav.user = user;
+                    config::sanitized_toml(&c)
+                }) {
+                    Ok(body) => dav::backup(cred, body, tx, self.proxy.clone()),
+                    Err(e) => return self.notice(&e),
+                }
             }
-        });
+            "davlist" => dav::list_backups(cred, tx, self.proxy.clone()),
+            "restore" => {
+                let name = v["name"].as_str().unwrap_or("").to_string();
+                self.dav_cred = Some((cred.url.clone(), cred.user.clone(), cred.pass.clone()));
+                dav::restore(cred, name, tx, self.proxy.clone());
+            }
+            _ => return,
+        }
+        self.dav_rx = Some(rx);
+        self.call("davbusy", &[json!(true)]);
+    }
 
-        let Some(d) = self.draft.as_mut() else { return };
-        CentralPanel::default()
-            .frame(Frame::new().fill(BG).inner_margin(Margin::symmetric(12, 0)))
-            .show(ui, |ui| {
-                ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.label("hotkey");
-                        ui.add(TextEdit::singleline(&mut d.hotkey).desired_width(110.0));
-                        ui.checkbox(&mut d.autostart, "start at login");
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label("window");
-                        ui.add(DragValue::new(&mut d.width).range(200.0..=2000.0).speed(4));
-                        ui.label("x");
-                        ui.add(DragValue::new(&mut d.height).range(150.0..=2000.0).speed(4));
-                    });
-
-                    section(ui, "API");
-                    ui.add(
-                        TextEdit::singleline(&mut d.base_url)
-                            .desired_width(f32::INFINITY)
-                            .hint_text("base_url, e.g. https://openrouter.ai/api/v1"),
-                    );
-                    ui.add(
-                        TextEdit::singleline(&mut d.secret)
-                            .desired_width(f32::INFINITY)
-                            .password(true)
-                            .hint_text("api key (stored in %APPDATA%\\cue, outside the project)"),
-                    );
-                    ui.horizontal(|ui| {
-                        ui.checkbox(&mut d.reasoning, "reasoning");
-                        ui.add(
-                            TextEdit::singleline(&mut d.model)
-                                .desired_width(ui.available_width())
-                                .hint_text("model, e.g. openai/gpt-4o-mini"),
-                        );
-                    });
-
-                    section(ui, "ACTIONS");
-                    let mut remove = None;
-                    let global_reasoning = d.reasoning;
-                    for (i, a) in d.actions.iter_mut().enumerate() {
-                        ui.horizontal(|ui| {
-                            ui.add(
-                                TextEdit::singleline(&mut a.name)
-                                    .desired_width(110.0)
-                                    .hint_text("name"),
-                            );
-                            if ui.button("x").clicked() {
-                                remove = Some(i);
-                            }
-                            let mut eff = a.reasoning.unwrap_or(global_reasoning);
-                            if ui.checkbox(&mut eff, "reasoning").changed() {
-                                a.reasoning = Some(eff);
-                            }
-                            ui.add(
-                                TextEdit::singleline(&mut a.model)
-                                    .desired_width(ui.available_width())
-                                    .hint_text("model override (optional)"),
-                            );
-                        });
-                        // prompts fold to a one-line preview; clicking swaps
-                        // in the editor (desired_rows alone can't fold: it is
-                        // a minimum, content always grows the field)
-                        let pid = Id::new(("prompt", i));
-                        if d.expanded == Some(i) {
-                            let te = ui.add(
-                                TextEdit::multiline(&mut a.prompt)
-                                    .id(pid)
-                                    .desired_rows(4)
-                                    .desired_width(f32::INFINITY)
-                                    .hint_text("prompt; {{text}} = captured text"),
-                            );
-                            if d.focus_expanded {
-                                d.focus_expanded = false;
-                                te.request_focus();
-                            }
-                            if te.lost_focus() && d.expanded == Some(i) {
-                                d.expanded = None;
-                            }
-                        } else {
-                            let mut preview = one_line(&a.prompt);
-                            let r = ui.add(
-                                TextEdit::singleline(&mut preview)
-                                    .id(pid.with("preview"))
-                                    .desired_width(f32::INFINITY)
-                                    .hint_text("prompt; {{text}} = captured text"),
-                            );
-                            if r.gained_focus() {
-                                d.expanded = Some(i);
-                                d.focus_expanded = true;
-                            }
-                        }
-                        ui.add_space(8.0);
-                    }
-                    if let Some(i) = remove {
-                        d.actions.remove(i);
-                    }
-                    if ui.button("+ action").clicked() {
-                        d.actions.push(DraftAction {
-                            name: String::new(),
-                            prompt: "{{text}}".into(),
-                            model: String::new(),
-                            reasoning: None,
-                            base_url: None,
-                            api_key: None,
-                            key: None,
-                        });
-                    }
-
-                    section(ui, "WEBDAV BACKUP");
-                    ui.add(
-                        TextEdit::singleline(&mut d.dav_url)
-                            .desired_width(f32::INFINITY)
-                            .hint_text("folder url, e.g. https://dav.example.com/cue"),
-                    );
-                    ui.horizontal(|ui| {
-                        ui.add(
-                            TextEdit::singleline(&mut d.dav_user)
-                                .desired_width(140.0)
-                                .hint_text("user"),
-                        );
-                        ui.add(
-                            TextEdit::singleline(&mut d.dav_pass)
-                                .desired_width(ui.available_width())
-                                .password(true)
-                                .hint_text("password"),
-                        );
-                    });
-                    ui.horizontal(|ui| {
-                        let has_url = !d.dav_url.trim().is_empty();
-                        if ui.add_enabled(has_url && dav_idle, Button::new("backup")).clicked() {
-                            do_backup = true;
-                        }
-                        if dav::is_file_url(d.dav_url.trim()) {
-                            // single-file url: restore it directly, no list
-                            if ui.add_enabled(has_url && dav_idle, Button::new("restore")).clicked() {
-                                do_restore = true;
-                            }
-                        } else {
-                            // folder: the restore button drops the backup list
-                            // open on click (fetched lazily when first shown)
-                            ui.add_enabled_ui(has_url, |ui| {
-                                ui.menu_button("restore", |ui| match &dav_list {
-                                    None => {
-                                        ui.spinner();
-                                        do_list = true;
-                                    }
-                                    Some(names) if names.is_empty() => {
-                                        ui.label("no backups");
-                                    }
-                                    Some(names) => {
-                                        ui.set_min_width(180.0);
-                                        for n in names {
-                                            let label = n
-                                                .trim_start_matches("cue-settings")
-                                                .trim_start_matches('-')
-                                                .trim_end_matches(".toml");
-                                            let label = if label.is_empty() { n } else { label };
-                                            if ui.button(label).clicked() {
-                                                restore_pick = Some(n.clone());
-                                                ui.close();
-                                            }
-                                        }
-                                    }
-                                });
-                            });
-                        }
-                        if !dav_idle {
-                            ui.spinner();
-                        }
-                    });
-                    ui.add_space(12.0);
-                });
-            });
-
-        // a list fetch only starts when idle; the menu sets do_list each frame
-        let do_list = do_list && dav_idle;
-        if save {
-            self.dav_list = None;
-            self.save_settings();
-        } else if cancel {
-            self.draft = None;
-            self.dav_list = None;
-            self.mode = Mode::Assist;
-            self.hide();
-        } else if do_backup || do_restore || do_list || restore_pick.is_some() {
-            if let Some(d) = &self.draft {
-                let cred = Self::dav_cred(d);
-                let (tx, rx) = channel();
+    fn poll_dav(&mut self) {
+        let Some(rx) = self.dav_rx.take() else { return };
+        match rx.try_recv() {
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
                 self.dav_rx = Some(rx);
-                if do_backup {
-                    // back up the saved state on disk (sanitized), but carry
-                    // the webdav connection currently typed in the form -
-                    // otherwise a backup made before saving uploads a config
-                    // without it, and a later restore wipes the fields
-                    let (url, user) = (cred.url.clone(), cred.user.clone());
-                    match config::load().and_then(|(mut c, _)| {
+                return;
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {}
+            Ok(dav::Done::Backup(Ok(()))) => self.notice("backup uploaded"),
+            Ok(dav::Done::Backup(Err(e))) => self.notice(&format!("backup failed: {e}")),
+            Ok(dav::Done::List(Ok(names))) => {
+                if names.is_empty() {
+                    self.notice("no backups found");
+                }
+                self.call("davlist", &[json!(names)]);
+            }
+            Ok(dav::Done::List(Err(e))) => self.notice(&format!("list failed: {e}")),
+            Ok(dav::Done::Restore(Err(e))) => self.notice(&format!("restore failed: {e}")),
+            Ok(dav::Done::Restore(Ok(body))) => match toml::from_str::<config::Config>(&body) {
+                Ok(mut c) => {
+                    // a restore must not lose the webdav connection it was
+                    // performed with, even if the backup predates it
+                    let (url, user, pass) = self.dav_cred.take().unwrap_or_default();
+                    if c.webdav.url.is_empty() {
                         c.webdav.url = url;
                         c.webdav.user = user;
-                        config::sanitized_toml(&c)
-                    }) {
-                        Ok(body) => dav::backup(cred, body, tx, ctx.clone()),
-                        Err(e) => {
-                            self.dav_rx = None;
-                            self.notice = Some(e);
-                        }
                     }
-                } else if let Some(name) = restore_pick {
-                    self.dav_list = None;
-                    dav::restore(cred, name, tx, ctx.clone());
-                } else if do_restore {
-                    // single-file url: restore it directly
-                    dav::restore(cred, String::new(), tx, ctx.clone());
-                } else {
-                    dav::list_backups(cred, tx, ctx.clone());
+                    let merged = toml::to_string_pretty(&c).unwrap_or(body);
+                    let _ = config::save_raw(&merged);
+                    if let Ok((cfg, _)) = config::load() {
+                        self.cfg = cfg;
+                    }
+                    if self.mode == Mode::Settings {
+                        let pass = (!pass.is_empty()).then_some(pass);
+                        self.call(
+                            "settings",
+                            &[self.settings_payload(pass.as_deref()), json!(true)],
+                        );
+                    }
+                    self.notice("restored from webdav");
                 }
-            }
+                Err(e) => self.notice(&format!("restore: not a valid config: {e}")),
+            },
         }
-    }
-}
-
-impl eframe::App for App {
-    fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
-        let ctx = ui.ctx().clone();
-        let ctx = &ctx;
-        // dav results first, so a same-frame activation's fresh notice wins
-        self.poll_dav();
-        while let Ok(msg) = self.act_rx.try_recv() {
-            self.want_visible = true;
-            match msg {
-                // switches to the assist view but keeps the settings draft in
-                // the background; reopening settings restores it
-                Msg::Activate(text) => self.activate(text),
-                Msg::Settings => self.open_settings(),
-            }
-        }
-        // eframe force-shows the window after its first painted frame; undo
-        // any show we didn't ask for
-        if !self.want_visible && win::is_visible(self.hwnd) {
-            win::hide(self.hwnd);
-        }
-        self.poll_stream();
-        // Esc with a focused field only unfocuses it (egui side); a second
-        // Esc closes - prevents one keypress from discarding settings edits
-        if ctx.input(|i| i.key_pressed(Key::Escape)) && ctx.memory(|m| m.focused()).is_none() {
-            if self.mode == Mode::Settings {
-                self.draft = None;
-                self.mode = Mode::Assist;
-            }
-            self.hide();
-        }
-        // auto-hide once focus moves elsewhere (assist only: settings should
-        // survive a trip to the browser to copy an api key). had_focus guards
-        // the frames between showing and SetForegroundWindow landing.
-        if self.mode == Mode::Assist {
-            let focused = ctx.input(|i| i.viewport().focused.unwrap_or(true));
-            if focused {
-                self.had_focus = true;
-            } else if self.had_focus {
-                self.had_focus = false;
-                self.hide();
-            }
-        }
-
-        match self.mode {
-            Mode::Assist => self.assist_ui(ui, ctx),
-            Mode::Settings => self.settings_ui(ui, ctx),
-        }
-
-        // hairline window border
-        ctx.layer_painter(LayerId::new(Order::Foreground, Id::new("border"))).rect_stroke(
-            ctx.content_rect(),
-            CornerRadius::ZERO,
-            Stroke::new(1.0, BORDER),
-            StrokeKind::Inside,
-        );
+        self.call("davbusy", &[json!(false)]);
     }
 }

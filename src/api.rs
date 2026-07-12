@@ -46,12 +46,12 @@ pub fn stream(
     messages: Vec<serde_json::Value>,
     tx: Sender<Delta>,
     abort: Arc<AtomicBool>,
-    ctx: eframe::egui::Context,
+    proxy: tao::event_loop::EventLoopProxy<crate::Ev>,
 ) {
     std::thread::spawn(move || {
         let send = |d: Delta| {
             let _ = tx.send(d);
-            ctx.request_repaint();
+            let _ = proxy.send_event(crate::Ev::Wake);
         };
         let agent = match tls_agent(None, true) {
             Ok(a) => a,

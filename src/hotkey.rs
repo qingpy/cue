@@ -30,13 +30,12 @@ fn tray_img() -> tray_icon::Icon {
 }
 
 /// Runs hotkeys and the tray icon on a dedicated Win32 thread, independent
-/// of the render loop (eframe skips the UI of hidden windows, so they can't
-/// poll anything). Showing/positioning the window happens here via HWND; the
-/// app just receives `Msg`. A failing hotkey degrades to a returned notice.
-/// Hotkey changes take effect on restart.
+/// of the UI event loop. Showing/positioning the window happens here via
+/// HWND; the app just receives `Msg` after a wake. A failing hotkey degrades
+/// to a returned notice. Hotkey changes take effect on restart.
 pub fn spawn(
     hwnd: win::Hwnd,
-    ctx: eframe::egui::Context,
+    proxy: tao::event_loop::EventLoopProxy<crate::Ev>,
     cfg: &config::Config,
     tx: Sender<Msg>,
 ) -> Option<String> {
@@ -72,14 +71,14 @@ pub fn spawn(
         // Send before showing: showing first can trigger a UI frame that sees
         // an unexplained visible window and hides it again.
         let send = {
-            let ctx = ctx.clone();
+            let proxy = proxy.clone();
             Arc::new(move |msg: Msg, at: Option<(i32, i32)>, size: (f32, f32), topmost: bool| {
                 let _ = tx.send(msg);
                 match at {
                     Some((x, y)) => win::show_at(hwnd, x, y, size),
                     None => win::show_centered(hwnd, size, topmost),
                 }
-                ctx.request_repaint();
+                let _ = proxy.send_event(crate::Ev::Wake);
             })
         };
         let cfg_size = || config::load().map(|(c, _)| c.size()).unwrap_or((560.0, 600.0));

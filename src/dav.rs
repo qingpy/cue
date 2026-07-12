@@ -114,24 +114,26 @@ fn list(c: &Cred) -> Result<Vec<String>, String> {
     Ok(names)
 }
 
-pub fn backup(c: Cred, body: String, tx: Sender<Done>, ctx: eframe::egui::Context) {
+type Wake = tao::event_loop::EventLoopProxy<crate::Ev>;
+
+pub fn backup(c: Cred, body: String, tx: Sender<Done>, proxy: Wake) {
     std::thread::spawn(move || {
         let _ = tx.send(Done::Backup(put(&c, &body)));
-        ctx.request_repaint();
+        let _ = proxy.send_event(crate::Ev::Wake);
     });
 }
 
 /// name = "" restores the url itself (single-file mode).
-pub fn restore(c: Cred, name: String, tx: Sender<Done>, ctx: eframe::egui::Context) {
+pub fn restore(c: Cred, name: String, tx: Sender<Done>, proxy: Wake) {
     std::thread::spawn(move || {
         let _ = tx.send(Done::Restore(get(&c, &name)));
-        ctx.request_repaint();
+        let _ = proxy.send_event(crate::Ev::Wake);
     });
 }
 
-pub fn list_backups(c: Cred, tx: Sender<Done>, ctx: eframe::egui::Context) {
+pub fn list_backups(c: Cred, tx: Sender<Done>, proxy: Wake) {
     std::thread::spawn(move || {
         let _ = tx.send(Done::List(list(&c)));
-        ctx.request_repaint();
+        let _ = proxy.send_event(crate::Ev::Wake);
     });
 }

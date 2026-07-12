@@ -1,0 +1,348 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+* { box-sizing: border-box; margin: 0; font-family: "Segoe UI", system-ui, "Microsoft YaHei", sans-serif; }
+html, body { height: 100%; }
+body {
+  background: #fafaf9; color: #3a3a38; font-size: 14px;
+  border: 1px solid #a0a09b; overflow: hidden; user-select: none; cursor: default;
+}
+#resp, input, textarea { user-select: text; }
+.view { display: flex; flex-direction: column; height: 100%; padding: 12px; }
+[hidden] { display: none !important; }
+
+.bar { display: flex; height: 16px; align-items: center; margin-bottom: 8px; }
+.bar .title { font-family: Consolas, monospace; font-size: 11px; color: #82827d; letter-spacing: 1px; flex: 1; }
+.bar .x { width: 24px; text-align: center; color: #82827d; cursor: pointer; font-size: 14px; }
+.bar .x:hover { color: #282826; }
+
+input, textarea, button, select {
+  font-size: 13px; border: 1px solid #c9c9c4; border-radius: 0; outline: none; background: #fff; color: #3a3a38;
+}
+input, textarea { padding: 3px 6px; width: 100%; }
+input:focus, textarea:focus { border-color: #8a8a85; }
+textarea { resize: none; font-family: inherit; }
+button { background: #ececea; padding: 2px 10px; cursor: pointer; white-space: nowrap; }
+button:hover:not(:disabled) { background: #e2e2df; }
+button:disabled { color: #b0b0ab; cursor: default; }
+label { font-size: 13px; display: flex; align-items: center; gap: 4px; white-space: nowrap; }
+input[type=checkbox] { width: auto; }
+input[type=number] { width: 64px; }
+
+.notice { color: #82827d; font-size: 12px; margin-top: 4px; white-space: pre-wrap; }
+.row { display: flex; gap: 6px; margin-bottom: 6px; align-items: center; }
+.sect { font-family: Consolas, monospace; font-size: 10px; color: #82827d; margin: 12px 0 4px; letter-spacing: 1px; }
+
+#actions { margin-top: 6px; display: flex; flex-wrap: wrap; gap: 4px; }
+#resp { flex: 1; overflow-y: auto; margin: 8px 0; line-height: 1.5; }
+#resp p { margin: 0 0 10px; }
+#resp h1, #resp h2, #resp h3, #resp h4 { margin: 12px 0 6px; }
+#resp h1 { font-size: 20px; } #resp h2 { font-size: 17px; } #resp h3 { font-size: 15px; }
+#resp pre { background: #f1f1ef; border: 1px solid #ddddd9; padding: 8px; margin: 0 0 10px; position: relative; white-space: pre-wrap; word-break: break-word; }
+#resp code { font-family: Consolas, monospace; font-size: 12.5px; background: #f1f1ef; padding: 0 3px; }
+#resp pre code { padding: 0; background: none; }
+#resp ul, #resp ol { margin: 0 0 10px; padding-left: 20px; }
+.pcopy { position: absolute; top: 3px; right: 3px; font-size: 11px; padding: 0 6px; opacity: 0; user-select: none; }
+#resp pre:hover .pcopy { opacity: 1; }
+#resp blockquote { border-left: 3px solid #d0d0cb; color: #6a6a66; padding-left: 8px; margin: 0 0 10px; }
+#resp hr { border: none; border-top: 1px solid #d0d0cb; margin: 10px 0; }
+#resp table { border-collapse: collapse; margin: 0 0 10px; }
+#resp th, #resp td { border: 1px solid #d0d0cb; padding: 2px 8px; }
+#resp a { color: #3a6ea5; }
+.spin { display: inline-block; width: 9px; height: 9px; background: #9a9a95; animation: sp .8s linear infinite; }
+@keyframes sp { to { transform: rotate(180deg); } }
+
+.foot { display: flex; gap: 6px; align-items: center; }
+#followup { flex: 1; }
+
+#sform { flex: 1; overflow-y: auto; min-height: 0; }
+.arow input.aname { width: 110px; flex: none; }
+#dwrap { position: relative; }
+#dmenu { position: absolute; top: 100%; left: 0; min-width: 180px; background: #fff; border: 1px solid #a0a09b; z-index: 9; max-height: 200px; overflow-y: auto; }
+#dmenu div { padding: 3px 8px; cursor: pointer; font-size: 13px; }
+#dmenu div:hover { background: #ececea; }
+
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-thumb { background: #d4d4d0; }
+::-webkit-scrollbar-thumb:hover { background: #bcbcb8; }
+::-webkit-scrollbar-track { background: transparent; }
+</style>
+</head>
+<body>
+
+<div id="assist" class="view">
+  <div class="bar" data-drag><span class="title">CUE</span><span class="x" id="ax">&times;</span></div>
+  <input id="prev" placeholder="enter runs action 1">
+  <textarea id="inp" rows="2" placeholder="enter runs action 1" hidden></textarea>
+  <div id="actions"></div>
+  <div class="notice" id="anote"></div>
+  <div id="resp"></div>
+  <div class="foot">
+    <button id="copy" disabled>copy</button>
+    <input id="followup" placeholder="follow up">
+  </div>
+</div>
+
+<div id="settings" class="view" hidden>
+  <div class="bar" data-drag><span class="title">CUE &middot; SETTINGS</span><span class="x" id="sx">&times;</span></div>
+  <div id="sform">
+    <div class="row">
+      <label>hotkey <input id="s_hotkey" style="width:110px"></label>
+      <label><input type="checkbox" id="s_autostart"> start at login</label>
+    </div>
+    <div class="row">
+      <label>window <input type="number" id="s_width" min="200" max="2000"></label>
+      <span>x</span>
+      <label><input type="number" id="s_height" min="150" max="2000"></label>
+    </div>
+    <div class="sect">API</div>
+    <div class="row"><input id="s_base" placeholder="base_url, e.g. https://openrouter.ai/api/v1"></div>
+    <div class="row"><input id="s_secret" type="password" placeholder="api key (stored in %APPDATA%\cue, outside the project)"></div>
+    <div class="row">
+      <label><input type="checkbox" id="s_reason"> reasoning</label>
+      <input id="s_model" placeholder="model, e.g. openai/gpt-4o-mini">
+    </div>
+    <div class="sect">ACTIONS</div>
+    <div id="acts"></div>
+    <div class="row"><button id="s_add">+ action</button></div>
+    <div class="sect">WEBDAV BACKUP</div>
+    <div class="row"><input id="s_durl" placeholder="folder url, e.g. https://dav.example.com/cue"></div>
+    <div class="row">
+      <input id="s_duser" style="width:140px" placeholder="user">
+      <input id="s_dpass" type="password" placeholder="password">
+    </div>
+    <div class="row">
+      <button id="s_backup">backup</button>
+      <span id="dwrap"><button id="s_restore">restore</button><div id="dmenu" hidden></div></span>
+      <span class="spin" id="s_spin" hidden></span>
+    </div>
+  </div>
+  <div class="foot" style="margin-top:8px; flex-wrap:wrap">
+    <button id="s_save">save</button>
+    <button id="s_cancel">cancel</button>
+    <span class="notice" id="snote" style="margin:0"></span>
+  </div>
+</div>
+
+<script>
+'use strict';
+const post = o => window.ipc.postMessage(JSON.stringify(o));
+const $ = id => document.getElementById(id);
+let dirty = false;        // unsaved settings edits survive view switches
+let davNames = null;      // fetched backup list, null = not fetched yet
+
+// ---------- helpers ----------
+const firstLine = t => {
+  const lines = t.split('\n').filter(l => l.trim());
+  return lines.length ? lines[0] + (lines.length > 1 ? ' ...' : '') : '';
+};
+// fold a long text to a one-line preview; focusing the preview swaps in the editor
+function foldPair(prev, area, onEnter) {
+  prev.addEventListener('focus', () => {
+    prev.hidden = true; area.hidden = false;
+    area.focus(); area.setSelectionRange(0, 0);
+  });
+  area.addEventListener('blur', () => {
+    if (!area.value.trim()) return;   // folding an empty editor only loses the caret target
+    prev.value = firstLine(area.value);
+    area.hidden = true; prev.hidden = false;
+  });
+  if (onEnter) area.addEventListener('keydown', e => {
+    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); area.blur(); onEnter(); }
+  });
+}
+
+// ---------- assist (Rust calls these) ----------
+function assist(input, actions, note, expand) {
+  $('settings').hidden = true; $('assist').hidden = false;
+  $('inp').value = input;
+  $('prev').value = firstLine(input);
+  $('inp').hidden = !expand; $('prev').hidden = expand;
+  const acts = $('actions'); acts.innerHTML = '';
+  actions.forEach((name, i) => {
+    const b = document.createElement('button');
+    b.textContent = (i + 1) + ' ' + name;
+    b.onclick = () => { b.blur(); run(i); };
+    acts.appendChild(b);
+  });
+  $('anote').textContent = note;
+  $('resp').innerHTML = '';
+  $('copy').disabled = true;
+  $('followup').value = '';
+  if (expand) $('inp').focus(); else if (document.activeElement) document.activeElement.blur();
+}
+// the assist() focus can land before the window takes OS focus; retry then
+window.addEventListener('focus', () => {
+  if (!$('assist').hidden && !$('inp').hidden && document.activeElement === document.body) {
+    $('inp').focus();
+  }
+});
+function resp(html, streaming) {
+  const el = $('resp');
+  const stick = el.scrollTop + el.clientHeight >= el.scrollHeight - 40;
+  el.innerHTML = html;
+  el.querySelectorAll('pre').forEach(pre => {
+    const text = pre.innerText;
+    const b = document.createElement('button');
+    b.className = 'pcopy'; b.textContent = 'copy';
+    b.onclick = () => {
+      post({ cmd: 'copytext', text });
+      b.textContent = 'copied'; setTimeout(() => { b.textContent = 'copy'; }, 800);
+    };
+    pre.appendChild(b);
+  });
+  if (streaming && stick) el.scrollTop = el.scrollHeight;
+  $('copy').disabled = html === '';
+}
+function notice(t) {
+  ($('assist').hidden ? $('snote') : $('anote')).textContent = t;
+}
+const run = i => post({ cmd: 'run', idx: i, input: $('inp').value });
+
+foldPair($('prev'), $('inp'), () => run(0));
+$('ax').onclick = () => post({ cmd: 'close' });
+$('copy').onclick = () => post({ cmd: 'copy' });
+$('followup').addEventListener('keydown', e => {
+  if (e.key === 'Enter' && $('followup').value.trim()) {
+    post({ cmd: 'followup', text: $('followup').value });
+    $('followup').value = '';
+  }
+});
+
+// ---------- settings (Rust calls these) ----------
+function settings(cfg, force) {
+  $('assist').hidden = true; $('settings').hidden = false;
+  $('snote').textContent = '';
+  davNames = null; $('dmenu').hidden = true;
+  if (dirty && !force) return;      // keep the unsaved draft
+  dirty = false;
+  $('s_hotkey').value = cfg.hotkey; $('s_autostart').checked = cfg.autostart;
+  $('s_width').value = cfg.width; $('s_height').value = cfg.height;
+  $('s_base').value = cfg.base_url; $('s_secret').value = cfg.secret;
+  $('s_reason').checked = cfg.reasoning; $('s_model').value = cfg.model;
+  $('s_durl').value = cfg.dav_url; $('s_duser').value = cfg.dav_user; $('s_dpass').value = cfg.dav_pass;
+  $('acts').innerHTML = '';
+  cfg.actions.forEach(addAction);
+}
+function saved(note) { dirty = false; $('snote').textContent = note; }
+function davbusy(b) {
+  $('s_spin').hidden = !b;
+  $('s_backup').disabled = b; $('s_restore').disabled = b;
+}
+function davlist(names) {
+  davNames = names;
+  renderMenu();
+}
+function renderMenu() {
+  const m = $('dmenu'); m.innerHTML = ''; m.hidden = false;
+  if (davNames === null) { m.innerHTML = '<div>...</div>'; return; }
+  if (!davNames.length) { m.innerHTML = '<div>no backups</div>'; return; }
+  davNames.forEach(n => {
+    const d = document.createElement('div');
+    let label = n.replace(/^cue-settings-?/, '').replace(/\.toml$/, '');
+    d.textContent = label || n;
+    d.onclick = () => { m.hidden = true; post({ cmd: 'restore', name: n, dav: davCred() }); };
+    m.appendChild(d);
+  });
+}
+const davCred = () => ({ url: $('s_durl').value, user: $('s_duser').value, pass: $('s_dpass').value });
+
+function addAction(a) {
+  const row = document.createElement('div');
+  row.className = 'arow';
+  row.dataset.r = a.reasoning === null || a.reasoning === undefined ? '' : String(a.reasoning);
+  row.dataset.extra = JSON.stringify({ base_url: a.base_url, api_key: a.api_key, key: a.key });
+  row.innerHTML = '<div class="row">' +
+    '<input class="aname" placeholder="name">' +
+    '<button class="adel">x</button>' +
+    '<label><input type="checkbox" class="areason"> reasoning</label>' +
+    '<input class="amodel" placeholder="model override (optional)">' +
+    '</div>' +
+    '<input class="aprev" placeholder="prompt; {{text}} = captured text">' +
+    '<textarea class="aprompt" rows="4" hidden></textarea>' +
+    '<div style="height:8px"></div>';
+  row.querySelector('.aname').value = a.name;
+  row.querySelector('.amodel').value = a.model || '';
+  row.querySelector('.aprompt').value = a.prompt;
+  row.querySelector('.aprev').value = firstLine(a.prompt);
+  const cb = row.querySelector('.areason');
+  cb.checked = row.dataset.r === '' ? $('s_reason').checked : row.dataset.r === 'true';
+  cb.onchange = () => { row.dataset.r = String(cb.checked); };
+  row.querySelector('.adel').onclick = () => { row.remove(); dirty = true; };
+  foldPair(row.querySelector('.aprev'), row.querySelector('.aprompt'));
+  $('acts').appendChild(row);
+}
+
+function collect() {
+  return {
+    hotkey: $('s_hotkey').value, autostart: $('s_autostart').checked,
+    width: +$('s_width').value || 560, height: +$('s_height').value || 600,
+    base_url: $('s_base').value, model: $('s_model').value,
+    reasoning: $('s_reason').checked, secret: $('s_secret').value,
+    dav_url: $('s_durl').value, dav_user: $('s_duser').value, dav_pass: $('s_dpass').value,
+    actions: [...document.querySelectorAll('.arow')].map(row => {
+      const extra = JSON.parse(row.dataset.extra || '{}');
+      return {
+        name: row.querySelector('.aname').value,
+        prompt: row.querySelector('.aprompt').value,
+        model: row.querySelector('.amodel').value,
+        reasoning: row.dataset.r === '' ? null : row.dataset.r === 'true',
+        base_url: extra.base_url || null, api_key: extra.api_key || null, key: extra.key || null,
+      };
+    }),
+  };
+}
+
+$('s_add').onclick = () => { addAction({ name: '', prompt: '{{text}}', reasoning: null }); dirty = true; };
+$('s_save').onclick = () => post({ cmd: 'save', form: collect() });
+$('s_cancel').onclick = $('sx').onclick = () => { dirty = false; post({ cmd: 'close' }); };
+$('s_backup').onclick = () => post({ cmd: 'backup', dav: davCred() });
+$('s_restore').onclick = () => {
+  if (!$('s_durl').value.trim()) return;
+  if (/\.toml\/?\s*$/.test($('s_durl').value.trim())) {
+    post({ cmd: 'restore', name: '', dav: davCred() });
+  } else if ($('dmenu').hidden) {
+    renderMenu();
+    if (davNames === null) post({ cmd: 'davlist', dav: davCred() });
+  } else {
+    $('dmenu').hidden = true;
+  }
+};
+// global reasoning toggle refreshes rows that inherit it
+$('s_reason').addEventListener('change', () => {
+  document.querySelectorAll('.arow').forEach(row => {
+    if (row.dataset.r === '') row.querySelector('.areason').checked = $('s_reason').checked;
+  });
+});
+$('sform').addEventListener('input', () => { dirty = true; });
+
+// ---------- global ----------
+document.addEventListener('mousedown', e => {
+  if (e.target.closest('[data-drag]') && !e.target.closest('.x')) post({ cmd: 'drag' });
+  if (!e.target.closest('#dwrap')) $('dmenu').hidden = true;
+});
+document.addEventListener('click', e => {
+  const a = e.target.closest('a[href]');
+  if (a) { e.preventDefault(); post({ cmd: 'open', url: a.href }); }
+});
+document.addEventListener('keydown', e => {
+  const free = document.activeElement === document.body;
+  if (e.key === 'Escape') {
+    // assist closes right away; settings unfocuses first so one keypress
+    // can't discard edits
+    if ($('assist').hidden && !free) document.activeElement.blur();
+    else post({ cmd: 'close' });
+  } else if (free && !$('assist').hidden && e.key >= '1' && e.key <= '9') {
+    run(+e.key - 1);
+  }
+});
+document.addEventListener('contextmenu', e => {
+  // keep the browser menu only where selection/editing makes it useful
+  if (!e.target.closest('#resp, input, textarea')) e.preventDefault();
+});
+post({ cmd: 'ready' });
+</script>
+</body>
+</html>
