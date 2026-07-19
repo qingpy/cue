@@ -76,16 +76,47 @@ pub struct App {
 
 /// Markdown to HTML. Raw HTML in model output is neutralized to text: the
 /// page runs with an ipc bridge, so the response must stay inert markup.
+fn html_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// Markdown to HTML. Follow-up user lines are wrapped in U+001E record
+/// separators in the transcript and rendered as muted `<p class="ask">`.
 fn md_html(text: &str) -> String {
     use pulldown_cmark::{Event, Options, Parser, html};
-    let opts = Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TABLES | Options::ENABLE_TASKLISTS;
-    let parser = Parser::new_ext(text, opts).map(|ev| match ev {
-        Event::Html(h) => Event::Text(h),
-        Event::InlineHtml(h) => Event::Text(h),
-        ev => ev,
-    });
+    const SEP: char = '\u{1e}';
+    let md_chunk = |chunk: &str| -> String {
+        let opts = Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TABLES | Options::ENABLE_TASKLISTS;
+        let parser = Parser::new_ext(chunk, opts).map(|ev| match ev {
+            Event::Html(h) => Event::Text(h),
+            Event::InlineHtml(h) => Event::Text(h),
+            ev => ev,
+        });
+        let mut out = String::new();
+        html::push_html(&mut out, parser);
+        out
+    };
+    // odd split parts are ask lines: md \x1e ask \x1e md \x1e ask \x1e md
     let mut out = String::new();
-    html::push_html(&mut out, parser);
+    for (i, part) in text.split(SEP).enumerate() {
+        if i % 2 == 1 {
+            out.push_str("<p class=\"ask\">");
+            out.push_str(&html_escape(part));
+            out.push_str("</p>\n");
+        } else if !part.is_empty() {
+            out.push_str(&md_chunk(part));
+        }
+    }
     out
 }
 
@@ -456,7 +487,10 @@ impl App {
         }
         self.messages.push(api::assistant(&self.response));
         self.messages.push(api::user(&q));
-        self.transcript.push_str(&format!("{}\n\n---\n\n**{}**\n\n", self.response, q));
+        // muted plain line (class=ask), not bold — bold collides with model emphasis
+        let q = q.replace('\u{1e}', "");
+        self.transcript
+            .push_str(&format!("{}\n\n---\n\n\u{1e}{q}\u{1e}\n\n", self.response));
         self.start_stream();
     }
 
