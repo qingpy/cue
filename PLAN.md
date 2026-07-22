@@ -12,7 +12,11 @@ style: no rounded corners, hairline borders, Segoe UI + system CJK fallback.
 - One global hotkey (default alt+q). On press the hotkey thread captures the
   selection - UI Automation first (no keystrokes, no clipboard; a definitive
   "no selection" sends nothing), simulated Ctrl+C with clipboard save/restore
-  only when UIA can't answer (non-text clipboard is left untouched) - then
+  only when UIA can't answer (non-text clipboard is left untouched). VS Code
+  (Code.exe / Code - Insiders.exe) is special-cased: with editor a11y off,
+  Monaco's text pattern lies empty, so those processes use Ctrl+C plus VS
+  Code's `vscode-editor-data` (`isFromEmptySelection`) to tell real selection
+  from a caret-only line copy; integrated terminal focus skips Ctrl+C. Then
   shows the window at the cursor on the cursor's monitor and messages the UI.
 - Assist window (topmost, per-desktop): captured text on top (empty = input
   focused for typing), actions as numbered buttons (`1`-`9`, click, or Enter
